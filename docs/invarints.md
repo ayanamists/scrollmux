@@ -3,7 +3,7 @@
 这份文档记录当前设计必须守住的性质，尤其面向下一步要健壮化的两块：
 
 - 渲染路径：`pane vt100 stream -> pane cells -> host terminal drawing`
-- 输入路径：`host terminal event -> mux action 或 PTY input bytes`
+- 输入路径：`host stdin bytes -> mux action 或 PTY input bytes`
 
 这些不变量优先级高于具体实现。以后无论继续手写 `crossterm` renderer，还是迁到 `ratatui` / `tui-term`，都应该保持这些性质。
 
@@ -220,12 +220,12 @@ viewport 只影响显示，不影响生命周期。
 
 ## 输入不变量
 
-### 每个 key event 只能被分类一次
+### 每个输入片段只能被分发一次
 
-一个宿主终端 key event 只能落入以下两类之一：
+一个宿主终端输入片段只能落入以下两类之一：
 
 - ScrollMux 自己消费的 mux action。
-- 转发给 focused pane 的 PTY input bytes。
+- 原样转发给 focused pane 的 PTY input bytes。
 
 不能同时既触发 mux action 又转发给 PTY。
 
@@ -235,25 +235,19 @@ ScrollMux 保留的快捷键，例如 `Alt-h`、`Alt-l`、`Alt-n`、`Alt-w`，�
 
 它们不能被编码成 bytes 写入 focused pane，否则子进程会收到用户没有意图发送的 escape sequence。
 
-### 非 mux 输入应尽量保持终端语义
+### 非 mux 输入必须原样透传
 
-对于未被 ScrollMux 消费的输入，应尽量表现得像用户直接在普通终端中输入：
+对于未被 ScrollMux 消费的输入，应表现得像用户直接在普通终端中输入。ScrollMux 不再维护 key-to-bytes 反向映射表，而是把宿主 stdin 的原始 bytes 直接写入 focused PTY。
 
-- 普通字符转 UTF-8 bytes。
-- Enter 转 `\r`。
-- Tab 转 `\t`。
-- Backspace 使用当前项目约定的 `0x7f`。
-- 方向键和功能键转常见 xterm escape sequence。
-- Ctrl-letter 转控制字符。
-- 未保留的 Alt 组合键使用 ESC-prefix。
+这意味着普通字符、Enter、Tab、Backspace、方向键、功能键、Ctrl 字符、未保留 Alt 组合、IME/UTF-8、多种终端私有协议都保留 terminal emulator 实际发出的 bytes。
 
 这是兼容 shell、readline、vim、编辑器和 TUI 子程序的基础。
 
-### 只处理 press/repeat，不处理 release
+### 只有单个 mux 快捷键会被消费
 
-`KeyEventKind::Release` 不能触发 mux action，也不能转发给 PTY。
+输入层只在当前解析结果恰好是一个 mux 快捷键事件时消费 bytes。多个事件出现在同一个 stdin read 中时，即使其中包含 mux 快捷键，也整段透传给 focused PTY。
 
-否则一次按键可能产生重复动作或重复输入。
+这是保守策略：避免把同一个 read 里的普通输入误丢。
 
 ### Resize event 不是输入
 
@@ -271,16 +265,11 @@ PTY resize 应通过 PTY API 传递 terminal size，而不是通过输入字节�
 - viewport 滚动不改变输入目标。
 - 如果 focused pane 被关闭，focus 必须被调整到一个有效 pane，或在无 pane 时停止输入转发。
 
-### Paste 必须有明确策略
+### Paste 作为数据透传
 
-当前实现启用了 bracketed paste，但 `App::handle_event()` 没有处理 paste event。这是一个已知缺口。
+ScrollMux 启用宿主 bracketed paste，但 paste 不触发 mux 快捷键。输入层看到 paste 语义事件时，仍然把原始 bytes 透传给 focused PTY，包括 `\x1b[200~` / `\x1b[201~` markers。
 
-后续需要明确：
-
-- paste 内容是否总是转发给 focused PTY。
-- 是否要包裹 bracketed paste sequence。
-- paste 中的换行如何编码。
-- paste 是否允许触发 mux 快捷键。默认应不允许，paste 应作为数据转发。
+inner app 是否启用和处理 bracketed paste 由它自己决定。
 
 ## 重构边界
 
@@ -298,6 +287,7 @@ PTY resize 应通过 PTY API 传递 terminal size，而不是通过输入字节�
 - viewport 是宿主终端看到的横向切片。
 - input focus 和 viewport 位置解耦。
 - mux 快捷键先于 PTY 输入转发被消费。
+- 非 mux 输入必须以宿主 stdin 原始 bytes 形式转发，不做 byte→event→byte round-trip。
 - 子进程原始输出不能直接 replay 到宿主终端。
 
 ## 建议测试清单
@@ -329,15 +319,16 @@ PTY resize 应通过 PTY API 传递 terminal size，而不是通过输入字节�
 
 ### Input table tests
 
-对 `input::map()` 建表验证：
+对 `input::classify()` 和 `InputAccumulator` 建表验证：
 
 - 每个 mux 快捷键返回正确 action。
-- mux 快捷键不返回 `Action::Input`。
-- 普通字符、Enter、Tab、Backspace、方向键、F keys 编码符合预期。
-- Ctrl-letter 编码符合预期。
-- 未保留 Alt 字符编码为 ESC-prefix。
-- release event 返回 `None`。
-- repeat event 行为和 press 一致。
+- 非 mux 语义事件返回 `None`。
+- 单个 mux 快捷键被消费，不返回 `Action::Input`。
+- 裸 ESC timeout 后透传 `\x1b`。
+- bracketed paste 原始 bytes 透传。
+- 不完整 ESC 前缀在 `maybe_more=true` 时等待续行。
+- UTF-8 多字节原始 bytes 透传。
+- 多事件 read 整段透传，即使其中包含 mux 快捷键。
 
 ### Integration smoke tests
 

@@ -1,9 +1,9 @@
-//! Translate crossterm key events into either a workspace command or a byte
-//! sequence to forward to the focused PTY.
+//! Classify parsed terminal input into mux commands, while preserving raw bytes
+//! for the focused PTY whenever input is not a single mux shortcut.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use termwiz::input::{InputEvent, InputParser, KeyCode, Modifiers};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Quit,
     FocusPrev,
@@ -21,101 +21,194 @@ pub enum Action {
     Input(Vec<u8>),
 }
 
-pub fn map(ev: KeyEvent) -> Option<Action> {
-    // Only react to presses; releases would double-fire.
-    if !matches!(ev.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+pub fn classify(ev: &InputEvent) -> Option<Action> {
+    let InputEvent::Key(key) = ev else {
+        return None;
+    };
+    let modifiers = key.modifiers.remove_positional_mods();
+    if !modifiers.contains(Modifiers::ALT) {
         return None;
     }
-    let alt = ev.modifiers.contains(KeyModifiers::ALT);
-    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+    let shift = modifiers.contains(Modifiers::SHIFT);
 
-    if alt {
-        match ev.code {
-            KeyCode::Char('q') => return Some(Action::Quit),
-            KeyCode::Char('h') if shift => return Some(Action::MoveLeft),
-            KeyCode::Char('H') => return Some(Action::MoveLeft),
-            KeyCode::Char('l') if shift => return Some(Action::MoveRight),
-            KeyCode::Char('L') => return Some(Action::MoveRight),
-            KeyCode::Char('h') => return Some(Action::FocusPrev),
-            KeyCode::Char('l') => return Some(Action::FocusNext),
-            KeyCode::Char('n') => return Some(Action::NewPane),
-            KeyCode::Char('w') => return Some(Action::CloseFocused),
-            KeyCode::Char('f') => return Some(Action::Center),
-            KeyCode::Char('[') => return Some(Action::ScrollLeft),
-            KeyCode::Char(']') => return Some(Action::ScrollRight),
-            KeyCode::Char('=') | KeyCode::Char('+') => return Some(Action::GrowWidth),
-            KeyCode::Char('-') | KeyCode::Char('_') => return Some(Action::ShrinkWidth),
-            _ => {}
+    match key.key {
+        KeyCode::Char('q') => Some(Action::Quit),
+        KeyCode::Char('h') if shift => Some(Action::MoveLeft),
+        KeyCode::Char('H') => Some(Action::MoveLeft),
+        KeyCode::Char('l') if shift => Some(Action::MoveRight),
+        KeyCode::Char('L') => Some(Action::MoveRight),
+        KeyCode::Char('h') => Some(Action::FocusPrev),
+        KeyCode::Char('l') => Some(Action::FocusNext),
+        KeyCode::Char('n') => Some(Action::NewPane),
+        KeyCode::Char('w') => Some(Action::CloseFocused),
+        KeyCode::Char('f') => Some(Action::Center),
+        KeyCode::Char('[') => Some(Action::ScrollLeft),
+        KeyCode::Char(']') => Some(Action::ScrollRight),
+        KeyCode::Char('=') | KeyCode::Char('+') => Some(Action::GrowWidth),
+        KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::ShrinkWidth),
+        _ => None,
+    }
+}
+
+pub struct InputAccumulator {
+    parser: InputParser,
+    pending: Vec<u8>,
+}
+
+impl InputAccumulator {
+    pub fn new() -> Self {
+        Self {
+            parser: InputParser::new(),
+            pending: Vec::new(),
         }
     }
 
-    encode_for_pty(ev).map(Action::Input)
-}
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
 
-/// Best-effort key→bytes encoder. We aim for the common cases the shell needs;
-/// anything exotic gets dropped, which matches what most users hit in v0.1.
-fn encode_for_pty(ev: KeyEvent) -> Option<Vec<u8>> {
-    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = ev.modifiers.contains(KeyModifiers::ALT);
+    pub fn push(&mut self, bytes: &[u8], maybe_more: bool) -> Option<Action> {
+        self.pending.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        self.parser
+            .parse(bytes, |event| events.push(event), maybe_more);
+        self.dispatch(events, maybe_more)
+    }
 
-    let body: Vec<u8> = match ev.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                // Map Ctrl+letter to control characters (0x01..0x1f).
-                let lower = c.to_ascii_lowercase();
-                if lower.is_ascii_lowercase() {
-                    vec![(lower as u8) - b'a' + 1]
-                } else if c == ' ' {
-                    vec![0]
-                } else {
-                    let mut buf = [0u8; 4];
-                    c.encode_utf8(&mut buf).as_bytes().to_vec()
-                }
-            } else {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
+    pub fn finish(&mut self) -> Option<Action> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let mut events = Vec::new();
+        self.parser.parse(&[], |event| events.push(event), false);
+        self.dispatch(events, false)
+    }
+
+    fn dispatch(&mut self, events: Vec<InputEvent>, maybe_more: bool) -> Option<Action> {
+        if events.is_empty() {
+            if maybe_more || self.pending.is_empty() {
+                return None;
+            }
+            return Some(Action::Input(std::mem::take(&mut self.pending)));
+        }
+
+        if events.len() == 1 {
+            if let Some(action) = classify(&events[0]) {
+                self.pending.clear();
+                return Some(action);
             }
         }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
-            _ => return None,
-        },
-        _ => return None,
-    };
 
-    if alt {
-        // ESC-prefix encodes Alt for terminals in xterm mode.
-        let mut out = Vec::with_capacity(body.len() + 1);
-        out.push(0x1b);
-        out.extend_from_slice(&body);
-        Some(out)
-    } else {
-        Some(body)
+        Some(Action::Input(std::mem::take(&mut self.pending)))
+    }
+}
+
+impl Default for InputAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use termwiz::input::KeyEvent;
+
+    fn key(ch: char, modifiers: Modifiers) -> InputEvent {
+        InputEvent::Key(KeyEvent {
+            key: KeyCode::Char(ch),
+            modifiers,
+        })
+    }
+
+    #[test]
+    fn classifies_mux_shortcuts() {
+        let cases = [
+            ('q', Modifiers::ALT, Action::Quit),
+            ('h', Modifiers::ALT, Action::FocusPrev),
+            ('l', Modifiers::ALT, Action::FocusNext),
+            ('h', Modifiers::ALT | Modifiers::SHIFT, Action::MoveLeft),
+            ('H', Modifiers::ALT, Action::MoveLeft),
+            ('l', Modifiers::ALT | Modifiers::SHIFT, Action::MoveRight),
+            ('L', Modifiers::ALT, Action::MoveRight),
+            ('n', Modifiers::ALT, Action::NewPane),
+            ('w', Modifiers::ALT, Action::CloseFocused),
+            ('f', Modifiers::ALT, Action::Center),
+            ('[', Modifiers::ALT, Action::ScrollLeft),
+            (']', Modifiers::ALT, Action::ScrollRight),
+            ('=', Modifiers::ALT, Action::GrowWidth),
+            ('+', Modifiers::ALT, Action::GrowWidth),
+            ('-', Modifiers::ALT, Action::ShrinkWidth),
+            ('_', Modifiers::ALT, Action::ShrinkWidth),
+        ];
+
+        for (ch, modifiers, action) in cases {
+            assert_eq!(classify(&key(ch, modifiers)), Some(action));
+        }
+    }
+
+    #[test]
+    fn non_mux_events_are_not_classified() {
+        assert_eq!(classify(&key('h', Modifiers::NONE)), None);
+        assert_eq!(classify(&InputEvent::Paste("hello".into())), None);
+    }
+
+    #[test]
+    fn alt_h_is_consumed_when_it_is_the_only_event() {
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(b"\x1bh", true), Some(Action::FocusPrev));
+    }
+
+    #[test]
+    fn bare_escape_is_forwarded_after_timeout() {
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(b"\x1b", true), None);
+        assert_eq!(input.finish(), Some(Action::Input(b"\x1b".to_vec())));
+    }
+
+    #[test]
+    fn bracketed_paste_is_forwarded_with_markers() {
+        let bytes = b"\x1b[200~hello\x1b[201~";
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(bytes, true), Some(Action::Input(bytes.to_vec())));
+    }
+
+    #[test]
+    fn mouse_reports_are_forwarded_as_original_bytes() {
+        let bytes = b"\x1b[<66;42;12M\x1b[<67;42;12M";
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(bytes, true), Some(Action::Input(bytes.to_vec())));
+    }
+
+    #[test]
+    fn unclassified_escape_sequences_are_forwarded_after_timeout() {
+        let bytes = b"\x1b]52;c;abcd\x07";
+        let mut input = InputAccumulator::new();
+        let action = input.push(bytes, true).or_else(|| input.finish());
+        assert_eq!(action, Some(Action::Input(bytes.to_vec())));
+    }
+
+    #[test]
+    fn partial_alt_left_bracket_waits_for_timeout() {
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(b"\x1b[", true), None);
+        assert_eq!(input.finish(), Some(Action::ScrollLeft));
+    }
+
+    #[test]
+    fn split_utf8_is_forwarded_as_original_bytes() {
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(&[0xc3], true), None);
+        assert_eq!(
+            input.push(&[0xa9], true),
+            Some(Action::Input("é".as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn multi_event_read_is_forwarded_even_when_it_contains_a_mux_shortcut() {
+        let bytes = b"\x1bhls";
+        let mut input = InputAccumulator::new();
+        assert_eq!(input.push(bytes, true), Some(Action::Input(bytes.to_vec())));
     }
 }

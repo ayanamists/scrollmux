@@ -2,6 +2,8 @@ mod app;
 mod input;
 mod pane;
 mod render;
+mod signal_pump;
+mod stdin_pump;
 mod workspace;
 
 use std::io::{self, Write};

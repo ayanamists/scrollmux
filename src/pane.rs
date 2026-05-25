@@ -31,7 +31,12 @@ struct PtyHandles {
 
 impl Pane {
     /// Spawn a real PTY-backed pane running `command`.
-    pub fn spawn(name: String, command: &[String], width: u16, height: u16) -> std::io::Result<Self> {
+    pub fn spawn(
+        name: String,
+        command: &[String],
+        width: u16,
+        height: u16,
+    ) -> std::io::Result<Self> {
         if command.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

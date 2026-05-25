@@ -35,7 +35,7 @@ Out of scope for v0.1:
 - `src/workspace.rs`: state and layout math: panes, focus, viewport, visible clipping.
 - `src/pane.rs`: PTY lifecycle, `vt100::Parser`, reader thread, input writer.
 - `src/render.rs`: host terminal painter from pane cell models.
-- `src/input.rs`: crossterm key events to mux actions or PTY input bytes.
+- `src/input.rs`: raw stdin input parser, mux shortcut classifier, and PTY pass-through dispatch.
 - `perf/`: terminal-output performance scenarios.
 - `docs/current-design.zh.md`: concise Chinese design walkthrough.
 - `docs/invarints.md`: rendering/input invariants and test targets.
@@ -95,14 +95,16 @@ Current renderer is intentionally simple but expensive: it clears and redraws th
 
 ## Input Model
 
-Every key event must be classified exactly once:
+Host stdin bytes are parsed only to decide whether ScrollMux should consume a
+single mux shortcut. Raw bytes remain the source of truth for PTY input:
 
 - ScrollMux action, consumed by the mux.
-- PTY input bytes, forwarded only to the focused pane.
+- PTY input bytes, forwarded verbatim only to the focused pane.
 
-Mux shortcuts must not leak into PTYs. Non-mux input should behave like a normal terminal as much as possible: UTF-8 chars, Enter as `\r`, Backspace as `0x7f`, xterm-style arrows/function keys, Ctrl-letter control bytes, Alt as ESC-prefix when not reserved.
-
-Known input gap: bracketed paste is enabled, but paste handling needs an explicit policy before relying on it.
+Mux shortcuts must not leak into PTYs. Every other byte sequence should behave
+like a normal terminal because it is passed through without re-encoding. This
+includes paste markers, mouse reports, IME/UTF-8 input, kitty keyboard protocol
+sequences, and OSC52.
 
 ## Suggested Keybindings
 
@@ -122,6 +124,10 @@ Alt-q       quit
 ```
 
 Keep keybinding code simple and configurable later.
+
+Alt shortcuts require the host terminal to send ESC-prefixed Meta input. On
+Terminal.app, enable "Use Option as Meta key"; iTerm/Ghostty/WezTerm commonly
+send Meta-style input by default or expose an equivalent setting.
 
 ## MVP Scope
 
@@ -151,7 +157,8 @@ Nice to have later:
 Use established libraries where possible:
 
 - `portable-pty` for PTY management
-- `crossterm` for raw mode, alternate screen, input, host drawing
+- `crossterm` for raw mode, alternate screen, host drawing
+- `termwiz` for parsing raw host stdin bytes into semantic input events
 - `vt100` for terminal parsing/emulation
 - consider `ratatui` for host-side buffer/diff rendering if it preserves ScrollMux's viewport model
 

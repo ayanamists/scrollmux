@@ -3,19 +3,31 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event};
+use crossterm::style::Print;
 use crossterm::{cursor, execute, terminal};
 
-use crate::input::{self, Action};
+use crate::input::{Action, InputAccumulator};
 use crate::pane::Pane;
 use crate::render;
+use crate::signal_pump;
+use crate::stdin_pump;
 use crate::workspace::Workspace;
 
 const TICK_MS: u64 = 16;
+const ESCAPE_TIMEOUT_MS: u64 = 50;
 const SCROLL_STEP: i32 = 20;
 const WIDTH_STEP: i32 = 10;
+
+#[derive(Debug)]
+pub(crate) enum HostEvent {
+    Bytes(Vec<u8>),
+    Resize(u16, u16),
+    Tick,
+}
 
 pub struct App {
     ws: Workspace,
@@ -37,12 +49,7 @@ impl App {
     pub fn spawn_default(&mut self) -> io::Result<()> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let name = format!("col{}", self.next_id);
-        let pane = Pane::spawn(
-            name,
-            &[shell],
-            self.ws.default_width,
-            self.ws.pane_height(),
-        )?;
+        let pane = Pane::spawn(name, &[shell], self.ws.default_width, self.ws.pane_height())?;
         self.next_id += 1;
         self.ws.push_pane(pane);
         Ok(())
@@ -54,12 +61,24 @@ impl App {
 
         render::render(out, &self.ws)?;
 
+        let (tx, rx) = mpsc::channel();
+        let _stdin_handle = stdin_pump::spawn(tx.clone());
+        let _signal_handle = signal_pump::spawn(tx.clone())?;
+        let _tick_handle = spawn_tick_pump(tx);
+
+        let mut input = InputAccumulator::new();
+        let mut last_pending_input: Option<Instant> = None;
+
         while !self.quitting && !self.ws.panes.is_empty() {
-            // Block up to TICK_MS for an input event. If nothing arrives we
-            // still come back around to repaint dirty PTY output.
-            if event::poll(Duration::from_millis(TICK_MS))? {
-                self.handle_event(event::read()?)?;
+            match rx.recv_timeout(Duration::from_millis(ESCAPE_TIMEOUT_MS)) {
+                Ok(event) => {
+                    self.handle_host_event(event, &mut input, &mut last_pending_input)?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+
+            self.finish_pending_input_if_due(&mut input, &mut last_pending_input)?;
 
             self.reap_pending();
             if self.ws.panes.is_empty() {
@@ -94,20 +113,47 @@ impl App {
         false
     }
 
-    fn handle_event(&mut self, ev: Event) -> io::Result<()> {
+    fn handle_host_event(
+        &mut self,
+        ev: HostEvent,
+        input: &mut InputAccumulator,
+        last_pending_input: &mut Option<Instant>,
+    ) -> io::Result<()> {
         match ev {
-            Event::Key(k) => {
-                if let Some(action) = input::map(k) {
+            HostEvent::Bytes(bytes) => {
+                if let Some(action) = input.push(&bytes, true) {
+                    *last_pending_input = None;
                     self.handle_action(action)?;
+                } else if input.has_pending() {
+                    *last_pending_input = Some(Instant::now());
                 }
             }
-            Event::Resize(cols, rows) => {
+            HostEvent::Resize(cols, rows) => {
                 self.ws.handle_host_resize(cols, rows);
                 for p in &self.ws.panes {
                     p.dirty.store(true, Ordering::Release);
                 }
             }
-            _ => {}
+            HostEvent::Tick => {}
+        }
+        Ok(())
+    }
+
+    fn finish_pending_input_if_due(
+        &mut self,
+        input: &mut InputAccumulator,
+        last_pending_input: &mut Option<Instant>,
+    ) -> io::Result<()> {
+        let Some(last) = *last_pending_input else {
+            return Ok(());
+        };
+        if last.elapsed() < Duration::from_millis(ESCAPE_TIMEOUT_MS) {
+            return Ok(());
+        }
+
+        *last_pending_input = None;
+        if let Some(action) = input.finish() {
+            self.handle_action(action)?;
         }
         Ok(())
     }
@@ -199,7 +245,7 @@ impl TerminalGuard {
             io::stdout(),
             terminal::EnterAlternateScreen,
             cursor::Hide,
-            event::EnableBracketedPaste
+            Print("\x1b[?2004h")
         )?;
         Ok(Self { restored: false })
     }
@@ -211,7 +257,7 @@ impl TerminalGuard {
         self.restored = true;
         let _ = execute!(
             io::stdout(),
-            event::DisableBracketedPaste,
+            Print("\x1b[?2004l"),
             terminal::LeaveAlternateScreen,
             cursor::Show
         );
@@ -223,4 +269,13 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.restore();
     }
+}
+
+fn spawn_tick_pump(tx: mpsc::Sender<HostEvent>) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(TICK_MS));
+        if tx.send(HostEvent::Tick).is_err() {
+            break;
+        }
+    })
 }

@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 crossterm = "0.29"
 portable-pty = "0.9"
+signal-hook = "0.3"
+termwiz = { version = "0.23", default-features = false }
 vt100 = "0.15"
 
 [profile.release]

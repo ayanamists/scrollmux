@@ -137,9 +137,7 @@ impl Workspace {
 
     pub fn scroll_viewport(&mut self, delta: i32) {
         let new = self.viewport_x as i64 + delta as i64;
-        let max = self
-            .total_width()
-            .saturating_sub(self.screen_width as u32) as i64;
+        let max = self.total_width().saturating_sub(self.screen_width as u32) as i64;
         self.viewport_x = new.clamp(0, max.max(0)) as u32;
     }
 
