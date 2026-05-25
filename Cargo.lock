@@ -870,6 +870,7 @@ dependencies = [
  "portable-pty",
  "signal-hook",
  "termwiz",
+ "unicode-width",
  "vt100",
 ]
 
