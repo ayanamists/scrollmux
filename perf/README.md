@@ -11,7 +11,16 @@ host key events  -> mux action / PTY input bytes
 
 ## 运行
 
-先进入 Nix dev shell，让 perf 依赖固定下来：
+可以直接在本机运行，也可以进入 Nix dev shell 固定依赖。本机运行需要：
+
+- `bash`
+- `cargo`
+- `script`
+- `time`（GNU `time` 或 macOS/BSD `/usr/bin/time` 都可以）
+- `perl`、`awk`、`wc`
+- `nvim`（仅 `nvim-scroll` 场景需要）
+
+使用 Nix：
 
 ```bash
 nix develop
@@ -60,7 +69,7 @@ perf/run.sh --strace
 - `summary.tsv`：机器可读指标。
 - `<scenario>/direct.out`：direct raw terminal output。
 - `<scenario>/scrollmux.out`：scrollmux raw terminal output。
-- `<scenario>/*.time`：GNU time 结果。
+- `<scenario>/*.time`：`time` 结果；Linux/GNU time 和 macOS/BSD time 格式都会被解析。
 - `<scenario>/*.strace`：启用 `--strace` 时生成。
 
 目前采集的指标：

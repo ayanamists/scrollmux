@@ -10,7 +10,7 @@ scenario_prepare() {
   local cmd="$dir/run-nvim-scroll"
 
   if ! type -P nvim >/dev/null; then
-    echo "nvim not found; enter the Nix dev shell first: nix develop" >&2
+    echo "nvim not found; install it locally or enter the Nix dev shell: nix develop" >&2
     exit 2
   fi
 

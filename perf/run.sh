@@ -34,20 +34,45 @@ EOF
 need() {
   if ! type -P "$1" >/dev/null; then
     echo "missing required command: $1" >&2
-    echo "enter the Nix dev shell first: nix develop" >&2
+    echo "install it locally or enter the Nix dev shell: nix develop" >&2
     exit 2
   fi
 }
 
 time_bin() {
   local t
-  t="$(type -P time || true)"
+  t="$(type -P gtime || true)"
   if [[ -z "$t" ]]; then
-    echo "missing required command: GNU time" >&2
-    echo "enter the Nix dev shell first: nix develop" >&2
+    t="$(type -P time || true)"
+  fi
+  if [[ -z "$t" && -x /usr/bin/time ]]; then
+    t="/usr/bin/time"
+  fi
+  if [[ -z "$t" ]]; then
+    echo "missing required command: time" >&2
+    echo "install it locally or enter the Nix dev shell: nix develop" >&2
     exit 2
   fi
   printf '%s\n' "$t"
+}
+
+time_flavor() {
+  local t="$1"
+  local version
+  version="$("$t" --version 2>/dev/null || true)"
+  if [[ "$version" == *GNU* || "$version" == *gnu* ]]; then
+    printf 'gnu\n'
+  else
+    printf 'bsd\n'
+  fi
+}
+
+script_flavor() {
+  if script -qfec 'true' /dev/null >/dev/null 2>&1; then
+    printf 'util-linux\n'
+  else
+    printf 'bsd\n'
+  fi
 }
 
 scenario_files() {
@@ -87,7 +112,14 @@ quote() {
 count_pcre() {
   local file="$1"
   local pattern="$2"
-  { grep -aoP "$pattern" "$file" 2>/dev/null || true; } | wc -l | tr -d ' '
+  perl -0777 -e '
+    my $pattern = shift;
+    my $count = 0;
+    while (<>) {
+      $count++ while /$pattern/g;
+    }
+    print "$count\n";
+  ' "$pattern" "$file"
 }
 
 bytes_of() {
@@ -98,6 +130,50 @@ extract_time_field() {
   local file="$1"
   local key="$2"
   awk -F: -v key="$key" '$1 == key { gsub(/^[ \t]+/, "", $2); print $2; found=1 } END { if (!found) print "" }' "$file"
+}
+
+extract_user_seconds() {
+  local file="$1"
+  local value
+  value="$(extract_time_field "$file" "User time (seconds)")"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  awk 'NR == 1 && $2 == "real" && $4 == "user" { print $3; found=1 } END { if (!found) print "" }' "$file"
+}
+
+extract_system_seconds() {
+  local file="$1"
+  local value
+  value="$(extract_time_field "$file" "System time (seconds)")"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  awk 'NR == 1 && $2 == "real" && $6 == "sys" { print $5; found=1 } END { if (!found) print "" }' "$file"
+}
+
+extract_elapsed_time() {
+  local file="$1"
+  local value
+  value="$(extract_time_field "$file" "Elapsed (wall clock) time (h:mm:ss or m:ss)")"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  awk 'NR == 1 && $2 == "real" { print $1; found=1 } END { if (!found) print "" }' "$file"
+}
+
+extract_max_rss_kb() {
+  local file="$1"
+  local value
+  value="$(extract_time_field "$file" "Maximum resident set size (kbytes)")"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  awk '/maximum resident set size/ { printf "%.0f\n", $1 / 1024; found=1 } END { if (!found) print "" }' "$file"
 }
 
 write_metrics() {
@@ -116,10 +192,10 @@ write_metrics() {
   sgr="$(count_pcre "$output_file" '\x1b\[[0-9;]*m')"
   enter_alt="$(count_pcre "$output_file" '\x1b\[\?1049h')"
   leave_alt="$(count_pcre "$output_file" '\x1b\[\?1049l')"
-  user_s="$(extract_time_field "$time_file" "User time (seconds)")"
-  system_s="$(extract_time_field "$time_file" "System time (seconds)")"
-  elapsed="$(extract_time_field "$time_file" "Elapsed (wall clock) time (h:mm:ss or m:ss)")"
-  max_rss="$(extract_time_field "$time_file" "Maximum resident set size (kbytes)")"
+  user_s="$(extract_user_seconds "$time_file")"
+  system_s="$(extract_system_seconds "$time_file")"
+  elapsed="$(extract_elapsed_time "$time_file")"
+  max_rss="$(extract_max_rss_kb "$time_file")"
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$scenario" "$target" "$exit_code" "$bytes" "$clear_all" "$clear_line" \
@@ -138,34 +214,54 @@ run_pty() {
   local strace_file="$8"
   local driver="$9"
 
-  local time_cmd script_cmd q_time q_command q_bin q_strace
+  local measured_cmd time_cmd script_cmd status_file q_status
+  local q_time q_command q_bin q_strace q_time_bin
   q_time="$(quote "$time_file")"
   q_command="$(quote "$command_path")"
   q_bin="$(quote "$SCROLLMUX_BIN")"
+  q_time_bin="$(quote "$TIME_BIN")"
+  status_file="$output_file.exit"
+  q_status="$(quote "$status_file")"
+  rm -f "$status_file"
 
   if [[ "$mode" == "direct" ]]; then
-    time_cmd="$(quote "$TIME_BIN") -v -o $q_time $q_command"
+    measured_cmd="$q_command"
   else
-    time_cmd="$(quote "$TIME_BIN") -v -o $q_time env SHELL=$q_command $q_bin"
+    measured_cmd="env SHELL=$q_command $q_bin"
   fi
 
   if [[ "$RUN_STRACE" == "1" ]]; then
     q_strace="$(quote "$strace_file")"
     if [[ "$mode" == "direct" ]]; then
-      time_cmd="$(quote "$TIME_BIN") -v -o $q_time strace -qq -c -o $q_strace $q_command"
+      measured_cmd="strace -qq -c -o $q_strace $q_command"
     else
-      time_cmd="$(quote "$TIME_BIN") -v -o $q_time strace -qq -c -o $q_strace env SHELL=$q_command $q_bin"
+      measured_cmd="strace -qq -c -o $q_strace env SHELL=$q_command $q_bin"
     fi
   fi
 
-  script_cmd="stty rows $rows cols $cols; $time_cmd"
+  if [[ "$TIME_FLAVOR" == "gnu" ]]; then
+    time_cmd="$q_time_bin -v -o $q_time $measured_cmd"
+  else
+    # BSD/macOS time has no -o. Preserve the measured command's stderr on the
+    # PTY via fd 3 while sending time's own report to the .time file.
+    time_cmd="$q_time_bin -l sh -c $(quote "exec $measured_cmd 2>&3") sh 3>&2 2>$q_time"
+  fi
+
+  script_cmd="stty rows $rows cols $cols; $time_cmd; status=\$?; printf '%s\n' \"\$status\" > $q_status; exit \"\$status\""
 
   set +e
   set +o pipefail
-  "$driver" | TERM=xterm-256color script -qfec "$script_cmd" /dev/null >"$output_file" 2>"$error_file"
+  if [[ "$SCRIPT_FLAVOR" == "util-linux" ]]; then
+    "$driver" | TERM=xterm-256color script -qfec "$script_cmd" /dev/null >"$output_file" 2>"$error_file"
+  else
+    "$driver" | TERM=xterm-256color script -q /dev/null sh -lc "$script_cmd" >"$output_file" 2>"$error_file"
+  fi
   local exit_code=${PIPESTATUS[1]}
   set -o pipefail
-  set -e
+  if [[ -s "$status_file" ]]; then
+    exit_code="$(tr -dc '0-9' < "$status_file")"
+  fi
+  rm -f "$status_file"
   return "$exit_code"
 }
 
@@ -245,10 +341,13 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-need grep
+need awk
+need perl
 need script
 need wc
 TIME_BIN="$(time_bin)"
+TIME_FLAVOR="$(time_flavor "$TIME_BIN")"
+SCRIPT_FLAVOR="$(script_flavor)"
 if [[ "$RUN_STRACE" == "1" ]]; then
   need strace
 fi
@@ -265,6 +364,7 @@ fi
 
 OUT_DIR="${OUT_DIR:-$OUT_BASE/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 SUMMARY_TSV="$OUT_DIR/summary.tsv"
 SUMMARY_MD="$OUT_DIR/summary.md"
