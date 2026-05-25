@@ -1,0 +1,115 @@
+name: Perf Compare
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  terminal-output:
+    name: Terminal Output
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
+          path: base
+
+      - name: Checkout head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: head
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build comparison binaries
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path base/Cargo.toml
+          cargo build --release --manifest-path head/Cargo.toml
+          mkdir -p head/target/perf/ci-bin
+          cp base/target/release/scrollmux head/target/perf/ci-bin/scrollmux-base
+          cp head/target/release/scrollmux head/target/perf/ci-bin/scrollmux-head
+
+      - name: Run perf scenarios
+        working-directory: head
+        run: |
+          set -euo pipefail
+          scenarios=(plain-output ansi-burst)
+          scenario_args=()
+          for scenario in "${scenarios[@]}"; do
+            scenario_args+=(--scenario "$scenario")
+          done
+
+          perf/run.sh --no-build \
+            --bin target/perf/ci-bin/scrollmux-base \
+            --out target/perf/base \
+            "${scenario_args[@]}"
+
+          perf/run.sh --no-build \
+            --bin target/perf/ci-bin/scrollmux-head \
+            --out target/perf/head \
+            "${scenario_args[@]}"
+
+      - name: Write perf summary
+        working-directory: head
+        run: |
+          set -euo pipefail
+          base_tsv="target/perf/base/summary.tsv"
+          head_tsv="target/perf/head/summary.tsv"
+
+          {
+            echo "## Terminal Output Perf"
+            echo
+            echo "| Scenario | Metric | Base | Head | Delta |"
+            echo "| --- | --- | ---: | ---: | ---: |"
+            awk -F '\t' '
+              NR == FNR {
+                if (NR > 1 && $2 == "scrollmux") {
+                  bytes[$1] = $4
+                  clears[$1] = $5
+                  sgr[$1] = $8
+                }
+                next
+              }
+              NR > 1 && $2 == "scrollmux" {
+                scenario = $1
+                print_metric(scenario, "bytes", bytes[scenario], $4)
+                print_metric(scenario, "Clear(All)", clears[scenario], $5)
+                print_metric(scenario, "SGR", sgr[scenario], $8)
+              }
+              function print_metric(scenario, metric, base, head, delta) {
+                base += 0
+                head += 0
+                delta = base == 0 ? 0 : (head - base) * 100 / base
+                printf("| `%s` | %s | %d | %d | %.1f%% |\n", scenario, metric, base, head, delta)
+              }
+            ' "$base_tsv" "$head_tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          awk -F '\t' '
+            NR > 1 && $2 == "scrollmux" && $3 != 0 {
+              printf("benchmark target failed: scenario=%s exit=%s\n", $1, $3) > "/dev/stderr"
+              failed = 1
+            }
+            END { exit failed }
+          ' "$head_tsv"
+
+      - name: Upload perf artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-output-perf
+          path: |
+            head/target/perf/base/**
+            head/target/perf/head/**
