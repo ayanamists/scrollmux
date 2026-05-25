@@ -59,7 +59,9 @@ impl App {
         // Spawn an initial shell so the user sees something useful immediately.
         self.spawn_default()?;
 
-        render::render(out, &self.ws)?;
+        let mut renderer = render::Renderer::new();
+        renderer.render(out, &self.ws)?;
+        self.take_visible_dirty();
 
         let (tx, rx) = mpsc::channel();
         let _stdin_handle = stdin_pump::spawn(tx.clone());
@@ -85,8 +87,8 @@ impl App {
                 break;
             }
 
-            if self.any_dirty() || self.force_redraw() {
-                render::render(out, &self.ws)?;
+            if self.take_visible_dirty() || self.force_redraw() {
+                renderer.render(out, &self.ws)?;
             }
         }
 
@@ -100,11 +102,12 @@ impl App {
         Ok(())
     }
 
-    fn any_dirty(&self) -> bool {
-        self.ws
-            .panes
-            .iter()
-            .any(|p| p.dirty.swap(false, Ordering::AcqRel))
+    fn take_visible_dirty(&self) -> bool {
+        let mut dirty = false;
+        for vp in self.ws.visible_panes() {
+            dirty |= self.ws.panes[vp.idx].dirty.swap(false, Ordering::AcqRel);
+        }
+        dirty
     }
 
     fn force_redraw(&self) -> bool {
@@ -278,4 +281,27 @@ fn spawn_tick_pump(tx: mpsc::Sender<HostEvent>) -> thread::JoinHandle<()> {
             break;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::Pane;
+
+    #[test]
+    fn visible_dirty_ignores_offscreen_panes() {
+        let mut app = App::new(10, 5, 10);
+        app.ws.panes.push(Pane::fake(10, 4));
+        app.ws.panes.push(Pane::fake(10, 4));
+        app.ws.viewport_x = 0;
+
+        app.ws.panes[1].dirty.store(true, Ordering::Release);
+        assert!(!app.take_visible_dirty());
+        assert!(app.ws.panes[1].dirty.load(Ordering::Acquire));
+
+        app.ws.panes[0].dirty.store(true, Ordering::Release);
+        assert!(app.take_visible_dirty());
+        assert!(!app.ws.panes[0].dirty.load(Ordering::Acquire));
+        assert!(app.ws.panes[1].dirty.load(Ordering::Acquire));
+    }
 }
