@@ -2,6 +2,7 @@
 name = "scrollmux"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 description = "Fixed-width horizontal PTY strip — a terminal-native scrolling workspace"
 license = "MIT OR Apache-2.0"
 
