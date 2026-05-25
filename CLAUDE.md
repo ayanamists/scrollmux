@@ -1,6 +1,14 @@
 # ScrollMux Agent Notes
 
-ScrollMux is a terminal-native horizontal workspace for PTY sessions. It is inspired by niri/PaperWM-style spatial workflows, but it is not a window manager and not a full tmux/Zellij replacement.
+ScrollMux is a terminal multiplexer built around a terminal-native horizontal
+workspace for PTY sessions. It is inspired by niri/PaperWM-style spatial
+workflows: panes live in fixed-width columns on a horizontal strip, while the
+host terminal is only a viewport into that strip.
+
+Be honest about the product category: ScrollMux is in the same broad problem
+space as tmux and Zellij. The distinction is not "we are not a multiplexer";
+the distinction is that every feature must serve the fixed-width horizontal
+workspace model instead of growing toward a general-purpose tmux/Zellij clone.
 
 Core idea:
 
@@ -17,7 +25,38 @@ Fixed-width terminal panes live on a horizontal strip. The user's terminal windo
 2. Preserve pane width: adding panes, moving focus, and scrolling the viewport must not resize existing panes.
 3. Keep focus and viewport separate: focused pane receives input; `viewport_x` controls what is visible.
 4. Stay terminal-native: run inside existing terminal emulators and over SSH/devboxes.
-5. Avoid tmux/Zellij scope creep for v0.1.
+5. Add multiplexer features cautiously: accept the category, but keep the
+   interaction model centered on the horizontal spatial workspace.
+
+## Interaction Model
+
+The next product priority is a reliable, dogfoodable interaction model, not
+more renderer micro-optimization.
+
+Use niri/PaperWM as the north star:
+
+- Panes are columns on a long horizontal strip.
+- Creating a pane adds space to the right; it does not squeeze existing panes.
+- Focus and viewport are related but distinct. Focus decides where input goes;
+  viewport decides what region of the strip is visible.
+- Moving focus should make the focused pane reachable, but explicit viewport
+  scrolling should not silently change focus.
+- Users should be able to build spatial memory: editor left, agent next,
+  tests/logs/server further right, scratch at the end.
+- Offscreen panes are still alive and useful; hiding a pane from view is not
+  the same thing as suspending it.
+
+Dogfood-facing features should first make this model easy to enter and recover:
+
+- launch an initial named pane set from CLI arguments or a small config
+- stable pane names in the status bar
+- predictable focus, move, center, and viewport-scroll commands
+- simple close/quit behavior
+- eventually, an overview/jump surface for finding panes when the strip grows
+
+Features that are normal for multiplexers are allowed, but they must justify
+themselves against this model. Prefer a small, coherent spatial workflow over a
+large collection of generic session-management features.
 
 Out of scope for v0.1:
 
@@ -91,7 +130,16 @@ PTY output bytes must not be replayed directly to the host terminal. They contai
 PTY output bytes -> vt100::Parser -> pane-local cell grid -> viewport clipping -> host terminal drawing
 ```
 
-Current renderer is intentionally simple but expensive: it clears and redraws the visible workspace. The next robustness/perf step is host-side backbuffer/damage tracking, likely line/chunk based, inspired by Zellij's output buffer approach.
+The renderer keeps a host-side frame buffer and emits only changed rows after
+the first frame or a host-size change. Repeated full-screen `Clear(All)` is a
+regression because it causes visible flicker.
+
+Further renderer optimization is useful, but currently secondary to
+dogfooding. If revisited, the next step is line-internal chunk damage rather
+than whole-row redraws. Output byte amplification by itself is not a blocker:
+even mature multiplexers can amplify raw terminal output substantially. The
+important user-facing guardrail is avoiding repeated clears and visible
+flicker.
 
 ## Input Model
 
@@ -146,8 +194,9 @@ Required:
 
 Nice to have later:
 
-- config file and session restore
 - rename pane
+- config file and initial pane layout
+- lightweight session restore
 - command palette
 - basic pane scrollback
 - copy support through terminal selection or a focused copy mode
@@ -182,7 +231,10 @@ perf/run.sh --scenario nvim-scroll
 perf/run.sh --strace
 ```
 
-Key metric: output amplification from direct program output to ScrollMux-rendered output, especially for full-screen TUIs such as nvim.
+Key metric: repeated `Clear(All)` should stay near first-frame/resize-only.
+Output amplification from direct program output is still useful to track,
+especially for full-screen TUIs such as nvim, but it should not drive product
+work ahead of the interaction model.
 
 ## Development Guidance
 
